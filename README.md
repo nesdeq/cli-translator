@@ -22,7 +22,7 @@ An Oh My Zsh plugin that translates natural language descriptions into command-l
 1. Clone this repository to your Oh My Zsh plugins directory:
 
    ```bash
-   git clone https://github.com/yourusername/cli-translator.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/cli-translator
+   git clone https://github.com/nesdeq/cli-translator ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/cli-translator
    ```
 
 2. Add the plugin to your `.zshrc` file:

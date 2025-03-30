@@ -14,7 +14,8 @@ RESET="\033[0m"
 SYSTEM=$(uname -a)
 
 # Description of the system, optional and can leave empty ""
-DESCRIPTION="macOS 15.3.2 on a MacBook Pro M4 Pro 14-inch system"
+# DESCRIPTION="macOS 15.3.2 on a MacBook Pro M4 Pro 14-inch system"
+DESCRIPTION=""
 
 COMMON="You are an expert sys admin, running $DESCRIPTION, uname -a is $SYSTEM. Your task is to produce effective and efficient, executable shell commands. IMPORTANT: Return ONLY the raw command as plain text with no formatting, no markdown, no code blocks, and no explanations. Your output will be momentarily executed directly in the terminal."
 

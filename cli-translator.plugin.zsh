@@ -3,7 +3,7 @@
 # Version: 2.5
 
 # Configuration
-API_MODEL="gpt-4o"
+API_MODEL="gpt-4.1-mini"
 API_TEMP=0.0
 API_MAX_TOKENS=512
 
@@ -177,28 +177,44 @@ fix_command() {
 run_command() {
   local cmd="$1"
   
-  # Check if command is empty
+  # refuse empty
   if [[ -z "$cmd" ]]; then
     print_error "Empty command"
     return 1
   fi
   
-  # Run the command, capturing output, errors, and exit code
-  local output error exit_code
-  output=$(eval "$cmd" 2>/dev/null)
-  exit_code=$?
-  error=$(eval "$cmd" 2>&1 1>/dev/null)
-  
-  # Handle output and errors
-  if [[ $exit_code -eq 0 ]]; then
-    [[ -n "$output" ]] && echo "$output"
-    [[ -n "$error" && -z "$output" ]] && echo "$error"
-    return 0
-  else
-    [[ -n "$output" ]] && echo "$output"
-    [[ -n "$error" ]] && echo "$error"
-    return $exit_code
+  # 1) Detect destructive rm and offer backup
+  if [[ "$cmd" =~ ^rm[[:space:]] ]]; then
+    echo "WARNING: This will delete files/directories:"
+    echo "  $cmd"
+    echo -n "Backup targets before deletion? [y/N]: "
+    read -r _bk
+    if [[ "$_bk" =~ ^[Yy] ]]; then
+      local TSTAMP=$(date +'%Y%m%d_%H%M%S')
+      local BACKUP_DIR="${HOME}/.cli_translator_backups/${TSTAMP}"
+      mkdir -p "$BACKUP_DIR"
+      # extract arguments after 'rm'
+      local args=${cmd#rm*}
+      for tgt in $args; do
+        cp -r -- "$tgt" "$BACKUP_DIR"/ 2>/dev/null || :
+      done
+      echo "Backed up targets to $BACKUP_DIR"
+    fi
   fi
+  
+  # 2) Stream and capture both stdout & stderr
+  local out_file=$(mktemp)
+  local err_file=$(mktemp)
+  # live‐stream to screen, but also tee into files
+  eval "$cmd" 2> >(tee "$err_file" >&2) | tee "$out_file"
+  local exit_code=$?
+  
+  # 3) export paths & exit code for later fix_command usage
+  export RUN_CMD_OUT_FILE="$out_file"
+  export RUN_CMD_ERR_FILE="$err_file"
+  export RUN_CMD_EXIT_CODE=$exit_code
+
+  return $exit_code
 }
 
 # Main function
@@ -233,20 +249,16 @@ nl() {
   if [[ ! "$answer" =~ ^[yY](es)?$ ]]; then
     return 0
   fi
-  
-  # Run the command
+
+  # run the command (streams output live, captures it)
   run_command "$cmd"
-  local exit_code=$?
-  
-  # Handle command failure
-  if [[ $exit_code -ne 0 ]]; then
-    echo "Command failed with exit code $exit_code"
-    
-    # Get error message
+  local exit_code=$RUN_CMD_EXIT_CODE
+
+  # on failure, feed back stderr and propose a fix
+  if (( exit_code != 0 )); then
+    echo "→ Command failed with exit code $exit_code"
     local error
-    error=$(eval "$cmd" 2>&1 1>/dev/null)
-    
-    # Get fixed command
+    error=$(<"$RUN_CMD_ERR_FILE")
     local fixed_cmd
     fixed_cmd=$(fix_command "$cmd" "$error" "$request")
     
@@ -260,9 +272,14 @@ nl() {
     echo -ne "run ${GREEN}${fixed_cmd}${RESET} [y/n]? "
     read -r fix_answer
     
+    # clean up temp files
+    rm -f "$RUN_CMD_OUT_FILE" "$RUN_CMD_ERR_FILE"
+
     if [[ "$fix_answer" =~ ^[yY](es)?$ ]]; then
       run_command "$fixed_cmd"
-      return $?
+      local final_code=$RUN_CMD_EXIT_CODE
+      rm -f "$RUN_CMD_OUT_FILE" "$RUN_CMD_ERR_FILE"
+      return $final_code
     else
       return 0
     fi

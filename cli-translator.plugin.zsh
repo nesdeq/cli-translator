@@ -1,293 +1,203 @@
 #!/usr/bin/env zsh
-# cli-translator: Translate natural language into CLI commands
-# Version: 2.5
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ cli-translator.plugin.zsh                                                │
+# │ Translate natural language into CLI commands and analyze files           │
+# │ Version: 2.6                                                              │
+# └───────────────────────────────────────────────────────────────────────────┘
 
-# Configuration
-API_MODEL="gpt-4.1-mini"
-API_TEMP=0.0
-API_MAX_TOKENS=512
+# -------------------- Configuration ----------------------------------------
+typeset -g CT_MODEL="gpt-4.1-mini"
+typeset -g CT_TEMP="0.0"
+typeset -g CT_MAX_TOKENS="512"
+typeset -g CT_BACKUP_DIR="${HOME}/.cli_translator_backups"
 
-# Colors for output - only keeping GREEN for commands
-GREEN="\033[32m"
-RESET="\033[0m"
+# Colors (ANSI escape codes for echo -e)
+typeset -g CT_COLOR_CMD="\033[32m"      # green
+typeset -g CT_COLOR_FILE="\033[32m"     # green
+typeset -g CT_COLOR_BULLET="\033[33m"   # yellow
+typeset -g CT_COLOR_ERROR="\033[31m"    # red
+typeset -g CT_COLOR_RESET="\033[0m"
 
-SYSTEM=$(uname -a)
+# -------------------- Helpers ------------------------------------------------
+_ct::print() { echo -e "$@"; }
+_ct::error() { echo -e "${CT_COLOR_ERROR}Error:${CT_COLOR_RESET} $1"; }
 
-# Description of the system, optional and can leave empty ""
-# DESCRIPTION="macOS 15.3.2 on a MacBook Pro M4 Pro 14-inch system"
-DESCRIPTION=""
-
-COMMON="You are an expert sys admin, running $DESCRIPTION, uname -a is $SYSTEM. Your task is to produce effective and efficient, executable shell commands. IMPORTANT: Return ONLY the raw command as plain text with no formatting, no markdown, no code blocks, and no explanations. Your output will be momentarily executed directly in the terminal."
-
-# Print message (no color)
-print_msg() {
-  local msg=$1
-  echo "$msg"
-}
-
-# Print error message
-print_error() {
-  local msg=$1
-  echo "Error: $msg"
-}
-
-# Check prerequisites
-check_prereqs() {
-  if [[ -z "$OPENAI_API_KEY" ]]; then
-    print_error "OPENAI_API_KEY environment variable is not set."
-    echo "Set it with: export OPENAI_API_KEY=your_api_key"
-    return 1
-  fi
-
-  for cmd in curl jq; do
-    if ! command -v $cmd &>/dev/null; then
-      print_error "$cmd is required but not installed."
-      return 1
-    fi
+_ct::check_prereqs() {
+  [[ -n "$OPENAI_API_KEY" ]] || { _ct::error "OPENAI_API_KEY not set."; return 1; }
+  for cmd in curl jq file stat; do
+    command -v $cmd &>/dev/null || { _ct::error "$cmd is required."; return 1; }
   done
-  
   return 0
 }
 
-# Call OpenAI API
-call_api() {
-  local prompt="$1"
-  local system="$2"
-  local temp="${3:-$API_TEMP}"
-  local max_tokens="${4:-$API_MAX_TOKENS}"
-  
-  # Create temporary files for request and response
-  local req_file=$(mktemp)
-  local resp_file=$(mktemp)
-  
-  # Create simple JSON without relying on complex escaping
-  cat > "$req_file" <<EOF
-{
-  "model": "$API_MODEL",
-  "messages": [
-    {"role": "system", "content": "$system"},
-    {"role": "user", "content": "$prompt"}
-  ],
-  "temperature": $temp,
-  "max_tokens": $max_tokens
-}
-EOF
+# -------------------- OpenAI API caller -------------------------------------
+_ct::call_api() {
+  local prompt="$1" system_msg="$2"
+  local temp=${3:-$CT_TEMP} max_tok=${4:-$CT_MAX_TOKENS}
+  local req=$(mktemp) res=$(mktemp)
 
-  # Make API request
-  curl -s -S "https://api.openai.com/v1/chat/completions" \
+  # Build JSON safely via jq
+  jq -n \
+    --arg m   "$CT_MODEL" \
+    --arg sys "$system_msg" \
+    --arg usr "$prompt" \
+    --argjson t "$temp" \
+    --argjson mt "$max_tok" \
+  '{
+     model:       $m,
+     temperature: $t,
+     max_tokens:  $mt,
+     messages: [
+       {role:"system", content:$sys},
+       {role:"user",   content:$usr}
+     ]
+   }' >"$req"
+
+  curl -sS https://api.openai.com/v1/chat/completions \
        -H "Content-Type: application/json" \
        -H "Authorization: Bearer $OPENAI_API_KEY" \
-       -d @"$req_file" > "$resp_file"
-       
-  local curl_status=$?
-  
-  # Clean up request file
-  rm "$req_file"
-  
-  # Check for curl errors
-  if [[ $curl_status -ne 0 ]]; then
-    rm "$resp_file"
+       -d @"$req" >"$res" || { rm -f "$req" "$res"; return 1; }
+
+  rm -f "$req"
+
+  if grep -q '"error":' "$res"; then
+    local msg=$(jq -r '.error.message' <"$res")
+    rm -f "$res"
+    echo "ERROR: $msg"
     return 1
   fi
-  
-  # Extract content or error
-  if grep -q "\"error\":" "$resp_file"; then
-    local error=$(grep -o '"message": *"[^"]*"' "$resp_file" | cut -d'"' -f4)
-    rm "$resp_file"
-    echo "ERROR: $error"
-    return 1
-  fi
-  
-  # Extract response content without processing escapes
-  local content=""
-  content=$(cat "$resp_file" | jq -r '.choices[0].message.content')
-  rm "$resp_file"
-  
-  if [[ -z "$content" ]]; then
-    echo "ERROR: Empty response"
-    return 1
-  fi
-  
-  echo "$content"
-  return 0
+
+  jq -r '.choices[0].message.content // empty' <"$res"
+  rm -f "$res"
 }
 
-# Sanitize command of ANSI escape sequences and other unwanted characters
-sanitize_command() {
+# -------------------- Sanitizer ------------------------------------------------
+_ct::sanitize() {
+  local s="$1"
+  s=${s//\\033\[[0-9;]*[mK]/}
+  s=${s//$'\e'*\[[0-9;]*[mK]/}
+  echo "$s"
+}
+
+# -------------------- Execute & Repair ---------------------------------------
+_ct::run_cmd() {
   local cmd="$1"
-  
-  # Remove both forms of ANSI escape sequences
-  # 1. Literal form (as they appear in strings)
-  cmd=${cmd//\\033\[[0-9;]*[a-zA-Z]/}
-  
-  # 2. Actual escape characters
-  cmd=${cmd//$'\e'\[[0-9;]*[a-zA-Z]/}
-  
-  # 3. Additional form with backslashes
-  cmd=${cmd//\\\e\[[0-9;]*[a-zA-Z]/}
-  
-  # 4. The specific case observed
-  cmd=${cmd//\\033\[0m/}
-  
-  echo "$cmd"
-}
+  _ct::print "${CT_COLOR_CMD}→ $cmd${CT_COLOR_RESET}"
+  mkdir -p "$CT_BACKUP_DIR"
 
-# Get command from natural language
-get_command() {
-  local nl_request="$1"
-  local system="$COMMON Act as a command-line tool that converts natural language requests into executable shell commands."
-  local response=$(call_api "$nl_request" "$system")
-  
-  # Return error if API call failed
-  if [[ "$response" == ERROR:* ]]; then
-    echo "$response"
-    return 1
-  fi
-  
-  # Sanitize the response
-  local sanitized=$(sanitize_command "$response")
-  echo "$sanitized"
-  return 0
-}
-
-# Fix a failed command
-fix_command() {
-  local failed_cmd="$1"
-  local error_msg="$2"
-  local orig_request="$3"
-  
-  local system="$COMMON Given a failed command, its error message, and the user's intent, provide the corrected command without commentary. If dependencies are missing, include installation commands with appropriate && chaining. Check for command alternatives when possible, using conditional execution patterns like 'command || alternative_command'. Verify file/directory existence with tests where needed. Always provide a complete, executable solution that can be run directly in terminal with all necessary preparations and fallbacks included." 
-  local prompt="Intent: $orig_request\nFailed command: $failed_cmd\nError: $error_msg\nProvide correct command:"
-  
-  local response=$(call_api "$prompt" "$system")
-  
-  # Return error if API call failed
-  if [[ "$response" == ERROR:* ]]; then
-    echo "$response"
-    return 1
-  fi
-  
-  # Sanitize the response
-  local sanitized=$(sanitize_command "$response")
-  echo "$sanitized"
-  return 0
-}
-
-# Run a command and handle output
-run_command() {
-  local cmd="$1"
-  
-  # refuse empty
-  if [[ -z "$cmd" ]]; then
-    print_error "Empty command"
-    return 1
-  fi
-  
-  # 1) Detect destructive rm and offer backup
-  if [[ "$cmd" =~ ^rm[[:space:]] ]]; then
-    echo "WARNING: This will delete files/directories:"
-    echo "  $cmd"
-    echo -n "Backup targets before deletion? [y/N]: "
-    read -r _bk
-    if [[ "$_bk" =~ ^[Yy] ]]; then
-      local TSTAMP=$(date +'%Y%m%d_%H%M%S')
-      local BACKUP_DIR="${HOME}/.cli_translator_backups/${TSTAMP}"
-      mkdir -p "$BACKUP_DIR"
-      # extract arguments after 'rm'
-      local args=${cmd#rm*}
-      for tgt in $args; do
-        cp -r -- "$tgt" "$BACKUP_DIR"/ 2>/dev/null || :
-      done
-      echo "Backed up targets to $BACKUP_DIR"
+  # Backup before destructive rm
+  if [[ $cmd == rm\ * ]]; then
+    echo -n "Backup targets before rm? [y/N] "
+    read -r ans
+    if [[ $ans =~ ^[Yy] ]]; then
+      local ts=$(date +%Y%m%d_%H%M%S)
+      local bdir="$CT_BACKUP_DIR/$ts"
+      mkdir -p "$bdir"
+      for f in ${cmd#rm }; do cp -r -- "$f" "$bdir"/ &>/dev/null; done
+      echo "Saved backup → $bdir"
     fi
   fi
-  
-  # 2) Stream and capture both stdout & stderr
-  local out_file=$(mktemp)
-  local err_file=$(mktemp)
-  # live‐stream to screen, but also tee into files
-  eval "$cmd" 2> >(tee "$err_file" >&2) | tee "$out_file"
-  local exit_code=$?
-  
-  # 3) export paths & exit code for later fix_command usage
-  export RUN_CMD_OUT_FILE="$out_file"
-  export RUN_CMD_ERR_FILE="$err_file"
-  export RUN_CMD_EXIT_CODE=$exit_code
 
-  return $exit_code
+  CT_LAST_OUT=$(mktemp)
+  CT_LAST_ERR=$(mktemp)
+  eval "$cmd" \
+    > >(tee "$CT_LAST_OUT") \
+    2> >(tee "$CT_LAST_ERR" >&2)
+  CT_LAST_CODE=$?
 }
 
-# Main function
-nl() {
-  # Check if arguments are provided
-  if [[ $# -eq 0 ]]; then
-    echo "Usage: nl <description of command>"
-    echo "Example: nl list all files sorted by size"
-    return 1
-  fi
-  
-  # Check prerequisites
-  check_prereqs || return 1
-  
-  # Get natural language request
-  local request="$*"
-  
-  # Get command from API
-  local cmd
-  cmd=$(get_command "$request")
-  
-  # Check for API errors
-  if [[ "$cmd" == ERROR:* ]]; then
-    print_error "API Error: ${cmd#ERROR: }"
-    return 1
-  fi
-  
-  # Confirm command execution with new format - only command in green
-  echo -ne "run ${GREEN}${cmd}${RESET} [y/n]? "
-  read -r answer
-  
-  if [[ ! "$answer" =~ ^[yY](es)?$ ]]; then
-    return 0
-  fi
+_ct::repair() {
+  local cmd="$1" intent="$2"
+  local err; err=$(<"$CT_LAST_ERR")
+  local system_msg="You are an expert sysadmin. Given the failed command, its error, and the user's intent, provide a corrected one-line shell command without commentary."
+  local prompt
+  prompt=$(printf 'Intent: %s\nCommand: %s\nError: %s\nFix:' "$intent" "$cmd" "$err")
+  local fix=$(_ct::call_api "$prompt" "$system_msg")
+  echo "${fix##*$'\n'}"
+}
 
-  # run the command (streams output live, captures it)
-  run_command "$cmd"
-  local exit_code=$RUN_CMD_EXIT_CODE
-
-  # on failure, feed back stderr and propose a fix
-  if (( exit_code != 0 )); then
-    echo "→ Command failed with exit code $exit_code"
-    local error
-    error=$(<"$RUN_CMD_ERR_FILE")
-    local fixed_cmd
-    fixed_cmd=$(fix_command "$cmd" "$error" "$request")
-    
-    # Check for API errors
-    if [[ "$fixed_cmd" == ERROR:* ]]; then
-      print_error "Couldn't fix: ${fixed_cmd#ERROR: }"
-      return 1
-    fi
-    
-    # Confirm fixed command execution with only command in green
-    echo -ne "run ${GREEN}${fixed_cmd}${RESET} [y/n]? "
-    read -r fix_answer
-    
-    # clean up temp files
-    rm -f "$RUN_CMD_OUT_FILE" "$RUN_CMD_ERR_FILE"
-
-    if [[ "$fix_answer" =~ ^[yY](es)?$ ]]; then
-      run_command "$fixed_cmd"
-      local final_code=$RUN_CMD_EXIT_CODE
-      rm -f "$RUN_CMD_OUT_FILE" "$RUN_CMD_ERR_FILE"
-      return $final_code
+# -------------------- File Analysis ------------------------------------------
+_ct::format_analysis() {
+  while IFS= read -r L; do
+    if [[ $L == '====='* ]]; then
+      echo -e "${CT_COLOR_FILE}$L${CT_COLOR_RESET}"
+    elif [[ $L == '-'* ]]; then
+      echo -e "  ${CT_COLOR_BULLET}$L${CT_COLOR_RESET}"
     else
-      return 0
+      echo "$L"
     fi
+  done
+}
+
+analyze() {
+  (( $# )) || { _ct::error "Usage: analyze <file|dir|glob> [...]"; return 1; }
+  local -a all blob_lines
+  for pat in "$@"; do
+    local -a m=( ${(N)~pat} )
+    (( ${#m} )) && all+=( "${m[@]}" ) || _ct::error "No match: $pat"
+  done
+  (( ${#all[@]} )) || { _ct::error "No files to analyze."; return 1; }
+
+  for f in "${all[@]}"; do
+    local mime sz mt
+    mime=$(file --mime-type -b -- "$f" 2>/dev/null)
+    if stat --version &>/dev/null; then
+      sz=$(stat -c '%s' -- "$f" 2>/dev/null||echo "?")
+      mt=$(stat -c '%y' -- "$f" 2>/dev/null||echo "?")
+    else
+      sz=$(stat -f '%z' -- "$f" 2>/dev/null||echo "?")
+      mt=$(stat -f '%Sm' -- "$f" 2>/dev/null||echo "?")
+    fi
+    blob_lines+=( "===== $f | size=${sz} | modified=$mt =====" )
+
+    if [[ -d $f ]]; then
+      local cnt; cnt=$(ls -A -- "$f" | wc -l)
+      blob_lines+=( "[Directory: $cnt entries]" )
+    elif [[ $mime == text/* ]]; then
+      while IFS= read -r L; do
+        blob_lines+=( "$L" )
+      done < "$f"
+    else
+      blob_lines+=( "[Binary: $mime]" )
+    fi
+  done
+
+  local blob out
+  blob=$(printf '%s\n' "${blob_lines[@]}")
+  local system_msg="You are a concise code analyst. For each file, give max 2 bullet points describing purpose and issues."
+  out=$(_ct::call_api "$blob" "$system_msg")
+  echo -e "$out" | _ct::format_analysis
+}
+
+# -------------------- Natural Language → Command -----------------------------
+nl() {
+  if [[ $1 == analyze || $1 == inspect ]]; then
+    shift; analyze "$@"; return
   fi
-  
-  return 0
+  (( $# )) || { _ct::print "Usage: nl <natural language>"; return 1; }
+  _ct::check_prereqs || return
+  local intent="$*"
+  local system_msg="Act as a CLI translator. Return only a single line command without commentary."
+  local cmd=$(_ct::call_api "$intent" "$system_msg")
+  [[ $cmd == ERROR:* ]] && _ct::error "${cmd#ERROR: }" && return 1
+  cmd=$(_ct::sanitize "$cmd")
+
+  echo -e -n "${CT_COLOR_CMD}run $cmd${CT_COLOR_RESET} [y/n] "; read -r ans
+  [[ $ans =~ ^[Yy] ]] || return
+  _ct::run_cmd "$cmd"
+
+  if (( CT_LAST_CODE != 0 )); then
+    _ct::print "${CT_COLOR_ERROR}Command failed (exit $CT_LAST_CODE). Fixing...${CT_COLOR_RESET}"
+    local fixed
+    fixed=$(_ct::repair "$cmd" "$intent")
+    fixed=$(_ct::sanitize "$fixed")
+    echo -e -n "${CT_COLOR_CMD}run $fixed${CT_COLOR_RESET} [y/n] "; read -r ans2
+    [[ $ans2 =~ ^[Yy] ]] && _ct::run_cmd "$fixed"
+  fi
 }
 
 # Aliases
-alias translate="nl"
-alias cmd="nl"
+alias translate='nl'
+alias cmd='nl'
+
+# vim: ft=zsh ts=2 sw=2 sts=2 et

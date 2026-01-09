@@ -2,13 +2,13 @@
 # ┌───────────────────────────────────────────────────────────────────────────┐
 # │ cli-translator.plugin.zsh                                                │
 # │ Translate natural language into CLI commands and analyze files           │
-# │ Version: 2.6                                                              │
+# │ Version: 4.0                                                              │
 # └───────────────────────────────────────────────────────────────────────────┘
 
 # -------------------- Configuration ----------------------------------------
-typeset -g CT_MODEL="gpt-4.1-mini"
-typeset -g CT_TEMP="0.0"
-typeset -g CT_MAX_TOKENS="512"
+typeset -g CT_MODEL="gpt-5-mini"
+typeset -g CT_REASONING="medium"
+typeset -g CT_MAX_COMPLETION_TOKENS="2048"
 typeset -g CT_BACKUP_DIR="${HOME}/.cli_translator_backups"
 
 # Colors (ANSI escape codes for echo -e)
@@ -33,7 +33,7 @@ _ct::check_prereqs() {
 # -------------------- OpenAI API caller -------------------------------------
 _ct::call_api() {
   local prompt="$1" system_msg="$2"
-  local temp=${3:-$CT_TEMP} max_tok=${4:-$CT_MAX_TOKENS}
+  local reasoning=${3:-$CT_REASONING} max_tok=${4:-$CT_MAX_COMPLETION_TOKENS}
   local req=$(mktemp) res=$(mktemp)
 
   # Build JSON safely via jq
@@ -41,12 +41,12 @@ _ct::call_api() {
     --arg m   "$CT_MODEL" \
     --arg sys "$system_msg" \
     --arg usr "$prompt" \
-    --argjson t "$temp" \
+    --arg re  "$reasoning" \
     --argjson mt "$max_tok" \
   '{
-     model:       $m,
-     temperature: $t,
-     max_tokens:  $mt,
+     model:                  $m,
+     reasoning_effort:       $re,
+     max_completion_tokens:  $mt,
      messages: [
        {role:"system", content:$sys},
        {role:"user",   content:$usr}
@@ -85,18 +85,26 @@ _ct::run_cmd() {
   _ct::print "${CT_COLOR_CMD}→ $cmd${CT_COLOR_RESET}"
   mkdir -p "$CT_BACKUP_DIR"
 
-  # Backup before destructive rm
-  if [[ $cmd == rm\ * ]]; then
+  # Backup before destructive rm (extract targets after flags)
+  if [[ $cmd =~ ^rm[[:space:]] ]]; then
     echo -n "Backup targets before rm? [y/N] "
     read -r ans
     if [[ $ans =~ ^[Yy] ]]; then
       local ts=$(date +%Y%m%d_%H%M%S)
       local bdir="$CT_BACKUP_DIR/$ts"
       mkdir -p "$bdir"
-      for f in ${cmd#rm }; do cp -r -- "$f" "$bdir"/ &>/dev/null; done
+      local -a words=( ${(z)cmd} )
+      for w in "${words[@]:1}"; do
+        [[ $w == -* ]] && continue
+        [[ -e $w ]] && cp -r -- "$w" "$bdir"/ 2>/dev/null
+      done
       echo "Saved backup → $bdir"
     fi
   fi
+
+  # Cleanup previous temp files
+  [[ -n $CT_LAST_OUT ]] && rm -f "$CT_LAST_OUT"
+  [[ -n $CT_LAST_ERR ]] && rm -f "$CT_LAST_ERR"
 
   CT_LAST_OUT=$(mktemp)
   CT_LAST_ERR=$(mktemp)
@@ -131,6 +139,7 @@ _ct::format_analysis() {
 
 analyze() {
   (( $# )) || { _ct::error "Usage: analyze <file|dir|glob> [...]"; return 1; }
+  _ct::check_prereqs || return
   local -a all blob_lines
   for pat in "$@"; do
     local -a m=( ${(N)~pat} )
@@ -166,7 +175,7 @@ analyze() {
   blob=$(printf '%s\n' "${blob_lines[@]}")
   local system_msg="You are a concise code analyst. For each file, give max 2 bullet points describing purpose and issues."
   out=$(_ct::call_api "$blob" "$system_msg")
-  echo -e "$out" | _ct::format_analysis
+  echo "$out" | _ct::format_analysis
 }
 
 # -------------------- Natural Language → Command -----------------------------

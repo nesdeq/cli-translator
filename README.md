@@ -55,4 +55,4 @@ CT_MAX_COMPLETION_TOKENS="2048"
 
 ## License
 
-GPLv2 - See LICENSE file
+GPLv3 - See LICENSE file
